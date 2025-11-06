@@ -47,9 +47,6 @@ if not st.session_state.auth:
         else:
             st.error("Incorrect password.")
             st.stop()
-else:
-    # No extra status text – just keep it clean
-    pass
 
 # =========================
 # HELPERS
@@ -90,7 +87,6 @@ def extract_between_lines(lines: list[str], start_key: str, end_key: str | None)
     if end_idx == -1:
         end_idx = len(lines)
     block = lines[start_idx:end_idx]
-    # trim empties
     while block and not block[0].strip():
         block = block[1:]
     while block and not block[-1].strip():
@@ -149,7 +145,6 @@ def extract_airports_dict_from_lines(lines: list[str]) -> dict:
             if current:
                 airports[current].append(ln)
 
-    # normalize NIL blocks and join/bulletize long NOTAM chains
     out = {}
     for k, v in airports.items():
         txt = "\n".join(v).strip()
@@ -179,7 +174,6 @@ def extract_demand(lines: list[str]) -> pd.DataFrame:
             continue
         pm = period.match(ln)
         if pm:
-            # look at next non-empty line for value
             j = i + 1
             while j < len(lines) and not lines[j].strip():
                 j += 1
@@ -207,13 +201,9 @@ def range_overlaps_hour(start_hhmm: str, end_hhmm: str, hour_start_min: int, hou
     if s <= e:
         return not (e <= hour_start_min or s >= hour_end_min)
     else:
-        # wraps midnight: treat as [s, 1440) U [0, e)
         return not (hour_end_min <= s and hour_start_min >= e)
 
 def build_capacity_timeline() -> pd.DataFrame:
-    """
-    Build a 24-row table: Period, SouthCap, NorthCap, FIRCap
-    """
     rows = []
     for h in range(24):
         start = h * 60
@@ -246,6 +236,66 @@ def extract_met_block(lines: list[str]) -> str:
     while block and not block[-1].strip():
         block = block[:-1]
     return "\n".join(block)
+
+# ---------- NEW: NOTAM styling, Tactical Notes, A-CDM helpers ----------
+def style_notam_line(txt: str) -> str:
+    lower = txt.lower()
+    if "unserviceable" in lower or "closed" in lower or "withdrawn" in lower:
+        return f"⛔ **{txt}**"
+    if "caution" in lower or "interference" in lower or "jamming" in lower or "spoof" in lower:
+        return f"⚠️ **{txt}**"
+    if "trigger notam" in lower or "airac" in lower:
+        return f"✈️ {txt}"
+    return f"✈️ {txt}"
+
+TACTICAL_RULES = [
+    (re.compile(r"jamming|spoof|interference", re.I), "✅ Expect radar vectoring + RNAV degradation"),
+    (re.compile(r"\bTWY\b.*closed|Taxiway.*closed|TWY.*WIP", re.I), "✅ Possible departure sequence delays"),
+    (re.compile(r"STAR.*unavailable|IAC.*unavailable", re.I), "✅ Expect increased workload on radar arrival sequencing"),
+]
+
+def tactical_notes_from_text(txt: str) -> list[str]:
+    notes = []
+    for patt, hint in TACTICAL_RULES:
+        if patt.search(txt or ""):
+            notes.append(hint)
+    return sorted(set(notes))
+
+def category_by_util(u: float) -> str:
+    if u < 50: return "Green (<50%)"
+    if u < 80: return "Yellow (50–80%)"
+    return "Red (>80%)"
+
+def auto_split_recommendations(merged_df: pd.DataFrame) -> list[str]:
+    recs = []
+    for _, r in merged_df.iterrows():
+        u = (r["Overflights"] / r["FIRCap"] * 100) if r["FIRCap"] else 0.0
+        if u >= 60:
+            recs.append(f"✅ {r['Period (UTC)']}: Demand={int(r['Overflights'])}, FIRCap={int(r['FIRCap'])} → Util {u:.0f}% — Activate both splits as published.")
+    if not recs:
+        recs.append("ℹ️ No hour exceeds 60% of FIR capacity — base configuration acceptable.")
+    return recs
+
+def a_cdm_notes_for_orbi(text_block: str, met_block_text: str) -> list[str]:
+    notes = []
+    t = (text_block or "")
+    # RWY
+    if re.search(r"RWY.*closed", t, re.I):
+        notes.append("• RWY closure in effect — expect departure/arrival rate reductions.")
+    # TWY
+    if re.search(r"\bTWY\b.*(closed|WIP)", t, re.I):
+        notes.append("• Taxiway works/closure — possible ground movement delays.")
+    # Stands (placeholder: if not provided, mark as not reported)
+    notes.append("• Stand availability: no constraints reported in NOTAMs.")
+    # Weather
+    if met_block_text:
+        if re.search(r"CB|TS|wind|dust|sand|LLWS|turb|VIS", met_block_text, re.I):
+            notes.append("• Weather impact noted — coordinate with MET for rate adjustments.")
+        else:
+            notes.append("• Weather: no significant impact indicated.")
+    else:
+        notes.append("• Weather: MET block not found in PDF.")
+    return notes
 
 # =========================
 # DOWNLOAD & PARSE PDF (silent)
@@ -280,7 +330,7 @@ met_block = extract_met_block(pdf_lines)
 st.header("🛰️ ORBB – Airspace Information")
 if airspace_bullets:
     for it in airspace_bullets:
-        st.markdown(f"- {it}")
+        st.markdown(f"- {style_notam_line(it)}")
 else:
     st.info("No Airspace information found under the 'Airspace:' heading in the PDF.")
 
@@ -288,17 +338,22 @@ else:
 # UI: Airports
 # =========================
 st.header("🛬 Airport Information")
+orbi_text_cache = ""
 for ap in AIRPORT_ORDER:
     with st.expander(f"**{ap}**", expanded=(ap == "ORBI/BGW")):
         content = (airport_blocks.get(ap) or "").strip()
         if not content:
             st.info("No information found for this airport in the PDF.")
         elif content.upper() == "NIL":
-            st.success("NIL")
+            st.success("⛔ NIL")
         else:
             bullets = split_notams_to_bullets(content)
+            # Render NOTAMs with icons/colors
             for it in bullets:
-                st.markdown(f"- {it}")
+                st.markdown(f"- {style_notam_line(it)}")
+        # cache raw text for A-CDM if ORBI/BGW
+        if ap == "ORBI/BGW":
+            orbi_text_cache = content
 
 # =========================
 # UI: Predicted Demand vs Capacity (hourly)
@@ -306,12 +361,14 @@ for ap in AIRPORT_ORDER:
 st.header("📈 Predicted Hourly Demand (Overflights) & Capacity")
 if demand_df.empty:
     st.warning("Predicted Demand (hourly) not found in the PDF.")
+    merged = pd.DataFrame()
 else:
     merged = pd.merge(cap_timeline, demand_df, on="Period (UTC)", how="left")
     merged["Overflights"] = merged["Overflights"].fillna(0).astype(int)
     merged["Utilization % (FIR)"] = (merged["Overflights"] / merged["FIRCap"] * 100).round(1)
     st.dataframe(merged, use_container_width=True)
 
+    # Main line chart
     fig = px.line(
         merged,
         x="Period (UTC)",
@@ -321,8 +378,65 @@ else:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.metric("Peak Hour Overflights", int(merged["Overflights"].max()))
-    st.metric("Max Utilization % (FIR)", float(merged["Utilization % (FIR)"].max()))
+    # ---------- Heat Bar (under graph) ----------
+    heat_df = merged.copy()
+    heat_df["Bucket"] = heat_df["Utilization % (FIR)"].apply(category_by_util)
+    # Create a 1-height bar colored by bucket
+    hb = go.Figure()
+    hb.add_trace(go.Bar(
+        x=heat_df["Period (UTC)"],
+        y=[1]*len(heat_df),
+        marker_color=heat_df["Bucket"].map({
+            "Green (<50%)": "#34a853",
+            "Yellow (50–80%)": "#fbbc04",
+            "Red (>80%)": "#ea4335",
+        }),
+        hovertext=[f"{p}: {u}%" for p, u in zip(heat_df["Period (UTC)"], heat_df["Utilization % (FIR)"])],
+        hoverinfo="text",
+    ))
+    hb.update_layout(
+        height=120, margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, showticklabels=True, tickangle=45),
+        yaxis=dict(visible=False, range=[0, 1.1]),
+        title="FIR Utilization Heat Bar (Green/Yellow/Red)",
+    )
+    st.plotly_chart(hb, use_container_width=True)
+
+# =========================
+# UI: Tactical ATC Notes (separate)
+# =========================
+st.header("🧠 Tactical ATC Notes (Auto-Generated)")
+any_note = False
+# Collect notes per airport
+for ap in AIRPORT_ORDER:
+    raw = (airport_blocks.get(ap) or "").strip()
+    notes = tactical_notes_from_text(raw)
+    if notes:
+        any_note = True
+        with st.expander(f"{ap} – Tactical Notes"):
+            for n in notes:
+                st.write(n)
+if not any_note:
+    st.info("No specific tactical notes detected from NOTAM keywords.")
+
+# =========================
+# UI: Auto-Split Recommendations
+# =========================
+st.header("🧩 Auto-Split Recommendations")
+if not demand_df.empty and not merged.empty:
+    recs = auto_split_recommendations(merged)
+    for r in recs:
+        st.write(r)
+else:
+    st.info("No demand table available to compute split recommendations.")
+
+# =========================
+# UI: A-CDM Notes for ORBI/BGW (after ORBI)
+# =========================
+st.header("🏁 A-CDM Airport Coordination Notes — ORBI/BGW")
+acdm = a_cdm_notes_for_orbi(orbi_text_cache, met_block)
+for line in acdm:
+    st.write(line)
 
 # =========================
 # UI: MET (from PDF if present)
@@ -363,11 +477,11 @@ def build_adp_docx() -> BytesIO:
     doc.add_paragraph("Service Provider: GCANS-IRAQ").alignment = 1
     doc.add_paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')}")
 
-    # Airspace (bullets)
+    # Airspace
     doc.add_paragraph().add_run("Airspace Information").bold = True
     if airspace_bullets:
         for it in airspace_bullets:
-            doc.add_paragraph(it, style=None)
+            doc.add_paragraph(it)
     else:
         doc.add_paragraph("N/A")
 
@@ -402,16 +516,24 @@ def build_adp_docx() -> BytesIO:
     else:
         doc.add_paragraph("No demand data found in the PDF.")
 
-    # MET (optional)
-    if met_block:
-        doc.add_paragraph().add_run("ATFM Meteorological Forecast").bold = True
-        doc.add_paragraph(met_block)
+    # Tactical notes summary (optional)
+    doc.add_paragraph().add_run("Tactical ATC Notes (Summary)").bold = True
+    any_added = False
+    for ap in AIRPORT_ORDER:
+        raw = (airport_blocks.get(ap) or "").strip()
+        notes = tactical_notes_from_text(raw)
+        if notes:
+            any_added = True
+            doc.add_paragraph(ap)
+            for n in notes:
+                doc.add_paragraph(f"- {n}")
+    if not any_added:
+        doc.add_paragraph("No specific tactical notes detected.")
 
-    # ATFM Measures
-    doc.add_paragraph().add_run("ATFM Measures").bold = True
-    doc.add_paragraph("Rerouting: Change exit points NINVA→KABAN during congestion.")
-    for _, r in sector_table.iterrows():
-        doc.add_paragraph(f"- {r['Period (UTC)']} {r['Sector']} ({r['Configuration']}, {r['Flight Levels']}) – {r['Reason']}")
+    # A-CDM ORBI
+    doc.add_paragraph().add_run("A-CDM Notes — ORBI/BGW").bold = True
+    for line in a_cdm_notes_for_orbi(orbi_text_cache, met_block):
+        doc.add_paragraph(line)
 
     # Footer
     doc.add_paragraph("This app built and supervised by MM and CU.").alignment = 1
