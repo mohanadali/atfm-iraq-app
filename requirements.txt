@@ -5,3 +5,9 @@ requests
 python-docx
 plotly
 pydeck
+streamlit
+pandas
+requests
+python-docx
+plotly
+pdfplumber
