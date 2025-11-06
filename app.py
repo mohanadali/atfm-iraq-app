@@ -1,235 +1,434 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import requests
-import re
-import io
+import plotly.graph_objects as go
+import requests, re
 from io import BytesIO
-from pdfminer.high_level import extract_text
+from datetime import datetime
+from docx import Document
+import pdfplumber
 
-# ------------------------------
+# =========================
 # CONFIG
-# ------------------------------
-st.set_page_config(page_title="ATFM IRAQ – GCANS-IRAQ ADP", layout="wide")
+# =========================
+st.set_page_config(page_title="ATFM IRAQ – GCANS ADP (PDF Source)", layout="wide")
 PASSWORD = "atfmiraqmm"
 
-PDF_URL = "https://drive.google.com/uc?export=download&id=1g_f_vBXlv2QF9_b4QuNui_d6QiOF3ifS"
+PDF_VIEW_LINK = "https://drive.google.com/file/d/1g_f_vBXlv2QF9_b4QuNui_d6QiOF3ifS/view?usp=sharing"
 
-AIRPORT_ORDER = ["ORBI/BGW", "ORBM/OSM", "ORER/EBL", "ORKK/KIK", "ORMM/BSR", "ORNI/NJF", "ORSU/ISU"]
+# Sector base capacities
+CAP_SOUTH = 26
+CAP_NORTH = 27
 
-SECTOR_CAPACITY = {"South Sector": 26, "North Sector": 27}
+AIRPORT_ORDER = ["ORBI/BGW", "ORBM/OSM", "ORER/EBL", "ORKK/KIK", "ORMM/BSR", "ORNI/NJF"]
 
-# ------------------------------
+# Split windows (UTC) — inclusive of any overlap
+# Format "HHMM"
+SPLITS_SOUTH = [("0530", "0730"), ("1200", "1400"), ("2330", "0130")]  # crosses midnight
+SPLITS_NORTH = [("0600", "0800"), ("1200", "1400"), ("0000", "0200")]  # first hours
+
+# =========================
 # AUTH
-# ------------------------------
+# =========================
 if "auth" not in st.session_state:
     st.session_state.auth = False
 
-st.title("🇮🇶 ATFM IRAQ – GCANS-IRAQ Daily ATFM Plan")
+st.title("🇮🇶 ATFM IRAQ – GCANS-IRAQ Daily ATFM Plan Generator (PDF)")
 
 if not st.session_state.auth:
     with st.form("login"):
-        _u = st.text_input("Username")
-        _p = st.text_input("Password", type="password")
+        _u = st.text_input("Username (any):")
+        _p = st.text_input("Password:", type="password")
         ok = st.form_submit_button("Login")
     if ok:
         if _p == PASSWORD:
             st.session_state.auth = True
             st.experimental_rerun()
         else:
-            st.error("Wrong password.")
+            st.error("Incorrect password.")
             st.stop()
 else:
-    st.success("✅ Authentication successful")
+    # No extra status text – just keep it clean
+    pass
 
-# ------------------------------
-# DOWNLOAD PDF
-# ------------------------------
-st.subheader("📥 Downloading ATFM Source File")
-
-try:
-    r = requests.get(PDF_URL, timeout=20)
-    r.raise_for_status()
-    raw_pdf = r.content
-    st.success("✅ PDF downloaded successfully")
-except Exception as e:
-    st.error(f"❌ Failed to download PDF: {e}")
-    st.stop()
-
-# ------------------------------
-# EXTRACT TEXT FROM PDF
-# ------------------------------
-st.subheader("📄 Extracting text from PDF...")
-try:
-    text = extract_text(BytesIO(raw_pdf))
-    st.success("✅ PDF text extracted")
-except:
-    st.error("❌ Failed to extract text")
-    st.stop()
-
-lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-# ------------------------------
+# =========================
 # HELPERS
-# ------------------------------
-def colorize_notam(nt):
-    nt_low = nt.lower()
+# =========================
+def drive_view_to_download_url(view_url: str) -> str | None:
+    m = re.search(r"/file/d/([A-Za-z0-9_-]{20,})/view", view_url)
+    if not m:
+        return None
+    file_id = m.group(1)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
-    if "unserviceable" in nt_low or "closed" in nt_low:
-        return f"⛔ **{nt}**"
-    if "caution" in nt_low or "interference" in nt_low:
-        return f"⚠️ **{nt}**"
-    if "trigger notam" in nt_low or "airac" in nt_low:
-        return f"✈️ {nt}"
-    return f"✈️ {nt}"
+def fetch_bytes(url: str) -> bytes:
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
 
-def split_notams_block(block):
-    parts = re.split(r"\b(A\d{4}/\d{2})", block)
-    notams = []
-    for i in range(1, len(parts), 2):
-        code = parts[i]
-        body = parts[i + 1].strip()
-        full = f"{code} – {body}"
-        notams.append(colorize_notam(full))
-    return notams
+def pdf_to_lines(pdf_bytes: bytes) -> list[str]:
+    lines: list[str] = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for ln in text.splitlines():
+                ln = ln.replace("\u2013", "–").replace("\u2014", "–").replace("\u00A0", " ")
+                lines.append(ln.rstrip())
+    return lines
 
-# ------------------------------
-# EXTRACT ORBB AIRSPACE
-# ------------------------------
-def extract_orbb(lines):
-    out = []
-    grab = False
-    for ln in lines:
-        if ln.startswith("Airspace"):
-            grab = True
+def extract_between_lines(lines: list[str], start_key: str, end_key: str | None) -> list[str]:
+    start_idx, end_idx = -1, -1
+    for i, ln in enumerate(lines):
+        if ln.strip() == start_key and start_idx == -1:
+            start_idx = i + 1
             continue
-        if ln.startswith("Airports:"):
+        if start_idx != -1 and end_key and ln.strip() == end_key:
+            end_idx = i
             break
-        if grab:
-            out.append(ln)
-    return "\n".join(out).strip()
+    if start_idx == -1:
+        return []
+    if end_idx == -1:
+        end_idx = len(lines)
+    block = lines[start_idx:end_idx]
+    # trim empties
+    while block and not block[0].strip():
+        block = block[1:]
+    while block and not block[-1].strip():
+        block = block[:-1]
+    return block
 
-# ------------------------------
-# EXTRACT AIRPORTS
-# ------------------------------
-AIRPORT_RE = re.compile(r"^(OR[A-Z]{2}/[A-Z]{3})(.*)$")
+def split_notams_to_bullets(block_text: str) -> list[str]:
+    """
+    Split NOTAM-style long text into bullets per A####/## item, keeping inner line breaks.
+    """
+    text = block_text.replace("•", "- ")
+    patt = re.compile(r"(A\d{4}/\d{2}\s*–\s*.*?)(?=A\d{4}/\d{2}\s*–|\Z)", re.DOTALL)
+    items = []
+    for m in patt.finditer(text):
+        item = m.group(1).strip()
+        item = re.sub(r"[ \t]+", " ", item)
+        items.append(item)
+    if not items:
+        return [ln for ln in text.splitlines() if ln.strip()]
+    return items
 
-def extract_airports(lines):
-    airports = {a: "" for a in AIRPORT_ORDER}
+def extract_airports_dict_from_lines(lines: list[str]) -> dict:
+    """
+    Airports section parser that ALSO handles headers with same-line NOTAMs.
+    Example line: 'ORER/EBL A0330/25 – RWY 36 ...'
+    """
+    stop_headers = {"Predicted Demand", "Predicted Demand:", "ATFM Measures:", "Special events:", "Special events"}
+    airports_start = -1
+    stop_at = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == "Airports:" and airports_start == -1:
+            airports_start = i + 1
+            continue
+        if airports_start != -1 and ln.strip() in stop_headers:
+            stop_at = i
+            break
+    if airports_start == -1:
+        return {}
+    if stop_at is None:
+        stop_at = len(lines)
+    sect = lines[airports_start:stop_at]
+
+    header_re = re.compile(r"^(OR[A-Z]{2}/[A-Z]{3})(.*)$")
+    airports: dict[str, list[str]] = {}
     current = None
-
-    for ln in lines:
-        m = AIRPORT_RE.match(ln)
+    for ln in sect:
+        m = header_re.match(ln.strip())
         if m:
-            current = m.group(1)
+            ap = m.group(1).strip()
             rest = m.group(2).strip()
+            current = ap
+            airports[current] = []
             if rest:
-                airports[current] += rest + " "
+                airports[current].append(rest)
         else:
             if current:
-                airports[current] += ln + " "
+                airports[current].append(ln)
 
-    # process NOTAMs
-    final = {}
-    for ap, txt in airports.items():
-        txt = txt.strip()
-        if txt.upper() == "NIL" or txt == "":
-            final[ap] = ["⛔ NIL"]
+    # normalize NIL blocks and join/bulletize long NOTAM chains
+    out = {}
+    for k, v in airports.items():
+        txt = "\n".join(v).strip()
+        if txt.upper() == "NIL":
+            out[k] = "NIL"
         else:
-            final[ap] = split_notams_block(txt)
-    return final
+            bullets = split_notams_to_bullets(txt)
+            out[k] = "\n\n".join(bullets)
+    return out
 
-# ------------------------------
-# EXTRACT PREDICTED DEMAND
-# ------------------------------
-def extract_demand(lines):
-    demand = {}
-    grab = False
-    for ln in lines:
-        if "Zulu Time Period" in ln:
-            grab = True
+def extract_demand(lines: list[str]) -> pd.DataFrame:
+    """
+    Supports both formats:
+      1) single-line: "0000–0100 73"
+      2) two-line:
+         "0000–0100"
+         "73"
+    """
+    rows = []
+    dash = r"[–-]"
+    single = re.compile(rf"^\s*(\d{{4}}){dash}(\d{{4}})\s+(\d+)\s*$")
+    period = re.compile(rf"^\s*(\d{{4}}){dash}(\d{{4}})\s*$")
+    for i, ln in enumerate(lines):
+        m = single.match(ln)
+        if m:
+            rows.append({"Period (UTC)": f"{m.group(1)}–{m.group(2)}", "Overflights": int(m.group(3))})
             continue
-        if grab:
-            m = re.match(r"(\d{4}–\d{4})\s+(\d+)", ln)
-            if m:
-                demand[m.group(1)] = int(m.group(2))
-            if "Total" in ln:
-                break
-    return demand
+        pm = period.match(ln)
+        if pm:
+            # look at next non-empty line for value
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and re.match(r"^\d+$", lines[j].strip()):
+                rows.append({"Period (UTC)": f"{pm.group(1)}–{pm.group(2)}", "Overflights": int(lines[j].strip())})
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        def k(p: str) -> int:
+            try:
+                return int(p.split("–")[0])
+            except:
+                return 0
+        df = df.sort_values(by="Period (UTC)", key=lambda s: s.map(k)).reset_index(drop=True)
+    return df
 
-# ------------------------------
-# RUN EXTRACTIONS
-# ------------------------------
-airspace_txt = extract_orbb(lines)
-airport_dict = extract_airports(lines)
-demand = extract_demand(lines)
+def hhmm_to_min(hhmm: str) -> int:
+    return int(hhmm[:2]) * 60 + int(hhmm[2:])
 
-# ------------------------------
-# DISPLAY: ORBB AIRSPACE
-# ------------------------------
+def range_overlaps_hour(start_hhmm: str, end_hhmm: str, hour_start_min: int, hour_end_min: int) -> bool:
+    """
+    Does [start,end) overlap hour interval? Handles wrap over midnight (e.g., 2330–0130).
+    """
+    s = hhmm_to_min(start_hhmm)
+    e = hhmm_to_min(end_hhmm)
+    if s <= e:
+        return not (e <= hour_start_min or s >= hour_end_min)
+    else:
+        # wraps midnight: treat as [s, 1440) U [0, e)
+        return not (hour_end_min <= s and hour_start_min >= e)
+
+def build_capacity_timeline() -> pd.DataFrame:
+    """
+    Build a 24-row table: Period, SouthCap, NorthCap, FIRCap
+    """
+    rows = []
+    for h in range(24):
+        start = h * 60
+        end = (h + 1) * 60
+        south_split = any(range_overlaps_hour(a, b, start, end) for a, b in SPLITS_SOUTH)
+        north_split = any(range_overlaps_hour(a, b, start, end) for a, b in SPLITS_NORTH)
+        south = CAP_SOUTH * (2 if south_split else 1)
+        north = CAP_NORTH * (2 if north_split else 1)
+        rows.append({"Period (UTC)": f"{h:02d}00–{(h+1)%24:02d}00", "SouthCap": south, "NorthCap": north, "FIRCap": south + north})
+    return pd.DataFrame(rows)
+
+def extract_met_block(lines: list[str]) -> str:
+    candidates = ["ATFM Meteorological Forecast", "Meteorological Forecast", "Weather", "MET:"]
+    heads = set(candidates)
+    idx = -1
+    for i, ln in enumerate(lines):
+        if ln.strip() in heads:
+            idx = i + 1
+            break
+    if idx == -1:
+        return ""
+    stop_heads = {"Airspace:", "Airports:", "Predicted Demand", "Predicted Demand:", "Predicted Demand Nov 07th, 2025:", "ATFM Measures:", "Special events:", "Special events"}
+    block = []
+    for j in range(idx, len(lines)):
+        if lines[j].strip() in stop_heads:
+            break
+        block.append(lines[j])
+    while block and not block[0].strip():
+        block = block[1:]
+    while block and not block[-1].strip():
+        block = block[:-1]
+    return "\n".join(block)
+
+# =========================
+# DOWNLOAD & PARSE PDF (silent)
+# =========================
+dl_url = drive_view_to_download_url(PDF_VIEW_LINK)
+if not dl_url:
+    st.error("Could not read the Google Drive file ID from the link.")
+    st.stop()
+try:
+    pdf_bytes = fetch_bytes(dl_url)
+except Exception as e:
+    st.error(f"Failed to download PDF: {e}")
+    st.stop()
+
+pdf_lines = pdf_to_lines(pdf_bytes)
+
+# =========================
+# EXTRACT SECTIONS
+# =========================
+airspace_lines = extract_between_lines(pdf_lines, "Airspace:", "Airports:")
+airspace_text = "\n".join(airspace_lines)
+airspace_bullets = split_notams_to_bullets(airspace_text) if airspace_text else []
+
+airport_blocks = extract_airports_dict_from_lines(pdf_lines)
+demand_df = extract_demand(pdf_lines)
+cap_timeline = build_capacity_timeline()
+met_block = extract_met_block(pdf_lines)
+
+# =========================
+# UI: Airspace
+# =========================
 st.header("🛰️ ORBB – Airspace Information")
-st.write(airspace_txt.replace(". ", ".\n"))
-
-# ------------------------------
-# DISPLAY: AIRPORTS
-# ------------------------------
-st.header("🛬 Airport Information")
-
-for ap in AIRPORT_ORDER:
-    with st.expander(f"**{ap}**"):
-        for nt in airport_dict[ap]:
-            st.markdown(f"- {nt}")
-
-# ------------------------------
-# DISPLAY: PREDICTED DEMAND
-# ------------------------------
-st.header("📈 Predicted Hourly Demand")
-
-if demand:
-    df = pd.DataFrame({"Zulu": list(demand.keys()), "OVF": list(demand.values())})
-    st.dataframe(df, use_container_width=True)
-
-    fig = px.line(df, x="Zulu", y="OVF", markers=True, title="Predicted Overflights")
-    st.plotly_chart(fig, use_container_width=True)
+if airspace_bullets:
+    for it in airspace_bullets:
+        st.markdown(f"- {it}")
 else:
-    st.warning("No predicted demand found.")
+    st.info("No Airspace information found under the 'Airspace:' heading in the PDF.")
 
-# ------------------------------
-# DISPLAY: SECTORIZATION / ATFM MEASURES
-# ------------------------------
-st.header("🛠️ ATFM Measures")
+# =========================
+# UI: Airports
+# =========================
+st.header("🛬 Airport Information")
+for ap in AIRPORT_ORDER:
+    with st.expander(f"**{ap}**", expanded=(ap == "ORBI/BGW")):
+        content = (airport_blocks.get(ap) or "").strip()
+        if not content:
+            st.info("No information found for this airport in the PDF.")
+        elif content.upper() == "NIL":
+            st.success("NIL")
+        else:
+            bullets = split_notams_to_bullets(content)
+            for it in bullets:
+                st.markdown(f"- {it}")
 
+# =========================
+# UI: Predicted Demand vs Capacity (hourly)
+# =========================
+st.header("📈 Predicted Hourly Demand (Overflights) & Capacity")
+if demand_df.empty:
+    st.warning("Predicted Demand (hourly) not found in the PDF.")
+else:
+    merged = pd.merge(cap_timeline, demand_df, on="Period (UTC)", how="left")
+    merged["Overflights"] = merged["Overflights"].fillna(0).astype(int)
+    merged["Utilization % (FIR)"] = (merged["Overflights"] / merged["FIRCap"] * 100).round(1)
+    st.dataframe(merged, use_container_width=True)
+
+    fig = px.line(
+        merged,
+        x="Period (UTC)",
+        y=["Overflights", "FIRCap"],
+        title="Overflights vs FIR Capacity by Hour",
+        markers=True,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.metric("Peak Hour Overflights", int(merged["Overflights"].max()))
+    st.metric("Max Utilization % (FIR)", float(merged["Utilization % (FIR)"].max()))
+
+# =========================
+# UI: MET (from PDF if present)
+# =========================
+if met_block:
+    st.header("🌤️ ATFM Meteorological Forecast")
+    st.write(met_block)
+
+# =========================
+# UI: ATFM Measures
+# =========================
+st.header("🧰 ATFM Measures (Applied / Available)")
 st.subheader("✅ Rerouting")
-st.write("""
-Change exit points between **NINVA → KABAN** during congestion periods.
-""")
+st.write("Change exit points between **NINVA → KABAN** during congestion to balance flows.")
 
-st.subheader("✅ Sectorization")
-st.write("""
-- **South Sector**
-  - South Low: FL240–FL350  
-  - South High: FL360–FL460  
-  - Periods: 0530–0730, 1200–1400, 2330–0130
+st.subheader("✅ Sectorisation (Time Windows & Levels)")
+sector_table = pd.DataFrame([
+    ["0530–0730 UTC", "South Sector", "South Low / South High", "FL240–350 / FL360–460", "Increase sector capacity"],
+    ["0600–0800 UTC", "North Sector", "North Low / North High", "FL240–350 / FL360–460", "Increase sector capacity"],
+    ["1200–1400 UTC", "South Sector", "South Low / South High", "FL240–350 / FL360–460", "Increase sector capacity"],
+    ["1200–1400 UTC", "North Sector", "North Low / North High", "FL240–350 / FL360–460", "Increase sector capacity"],
+    ["2330–0130 UTC", "South Sector", "South Low / South High", "FL240–350 / FL360–460", "Increase sector capacity"],
+    ["0000–0200 UTC", "North Sector", "North Low / North High", "FL240–350 / FL360–460", "Increase sector capacity"],
+], columns=["Period (UTC)", "Sector", "Configuration", "Flight Levels", "Reason"])
+st.dataframe(sector_table, use_container_width=True)
 
-- **North Sector**
-  - North Low: FL240–FL350  
-  - North High: FL360–FL460  
-  - Periods: 0600–0800, 1200–1400, 0000–0200
-""")
+# =========================
+# ADP (DOCX) generator
+# =========================
+st.header("🧾 Generate ATFM Daily Plan (DOCX)")
+adp_date = st.date_input("ADP Date (UTC)", value=datetime.utcnow().date())
 
-# ------------------------------
-# CDM SECTION
-# ------------------------------
-st.header("🤝 CDM – Collaborative Decision Making (Daily Guidance)")
-st.write("""
-- Ensure continuous coordination between **ACC**, **ATFM Unit**, **Airports**, and **Airlines**  
-- Communicate sector opening/closing times in advance  
-- Share expected weather impact and predicted demand with stakeholders  
-- Conduct pre-tactical review during morning briefing  
-- Validate any major airport constraints (RWY closures, TWY work, NOTAMs)
-""")
+def build_adp_docx() -> BytesIO:
+    doc = Document()
 
-# ------------------------------
-# END OF APP
-# ------------------------------
-st.info("✅ This ATFM Plan App is supervised by **MM & CU**")
+    title = doc.add_paragraph(f"ATFM Daily Plan – {adp_date.isoformat()}")
+    title.alignment = 1  # center
+    doc.add_paragraph("Service Provider: GCANS-IRAQ").alignment = 1
+    doc.add_paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')}")
+
+    # Airspace (bullets)
+    doc.add_paragraph().add_run("Airspace Information").bold = True
+    if airspace_bullets:
+        for it in airspace_bullets:
+            doc.add_paragraph(it, style=None)
+    else:
+        doc.add_paragraph("N/A")
+
+    # Airports
+    doc.add_paragraph().add_run("Airports").bold = True
+    for ap in AIRPORT_ORDER:
+        doc.add_paragraph(ap)
+        content = (airport_blocks.get(ap) or "").strip()
+        if not content:
+            doc.add_paragraph("No information found.")
+        elif content.upper() == "NIL":
+            doc.add_paragraph("NIL")
+        else:
+            for it in split_notams_to_bullets(content):
+                doc.add_paragraph(it)
+
+    # Demand vs Capacity
+    doc.add_paragraph().add_run("Predicted Demand vs FIR Capacity").bold = True
+    if 'merged' in locals() and not merged.empty:
+        t = doc.add_table(rows=1, cols=4)
+        hdr = t.rows[0].cells
+        hdr[0].text = "Period (UTC)"
+        hdr[1].text = "Overflights"
+        hdr[2].text = "FIRCap"
+        hdr[3].text = "Util %"
+        for _, row in merged.iterrows():
+            rr = t.add_row().cells
+            rr[0].text = str(row["Period (UTC)"])
+            rr[1].text = str(int(row["Overflights"]))
+            rr[2].text = str(int(row["FIRCap"]))
+            rr[3].text = f"{float(row['Utilization % (FIR)']):.1f}"
+    else:
+        doc.add_paragraph("No demand data found in the PDF.")
+
+    # MET (optional)
+    if met_block:
+        doc.add_paragraph().add_run("ATFM Meteorological Forecast").bold = True
+        doc.add_paragraph(met_block)
+
+    # ATFM Measures
+    doc.add_paragraph().add_run("ATFM Measures").bold = True
+    doc.add_paragraph("Rerouting: Change exit points NINVA→KABAN during congestion.")
+    for _, r in sector_table.iterrows():
+        doc.add_paragraph(f"- {r['Period (UTC)']} {r['Sector']} ({r['Configuration']}, {r['Flight Levels']}) – {r['Reason']}")
+
+    # Footer
+    doc.add_paragraph("This app built and supervised by MM and CU.").alignment = 1
+
+    out = BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out
+
+if st.button("Generate ADP (DOCX)"):
+    file = build_adp_docx()
+    st.download_button(
+        "⬇️ Download ADP (DOCX)",
+        data=file,
+        file_name=f"ATFM_ADP_{adp_date.isoformat()}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+st.divider()
+st.caption("GCANS-IRAQ — App built & supervised by **MM** and **CU**")
